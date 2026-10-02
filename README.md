@@ -1,3 +1,5 @@
+# If this app useful to ya, you can give me a star, i will share more :)
+
 # Nexus Mods Auto Downloader
 
 Paste a Nexus Mods link, pick a folder, click **Download**. The tool downloads that mod **and every mod it
