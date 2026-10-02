@@ -1,0 +1,29 @@
+# Python environments and caches (they contain absolute paths of the machine they were created on)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Data the tool keeps for the user. It normally lives in %LOCALAPPDATA%\NexusAutoDownloader, outside this
+# folder, but never commit any of it if it ever ends up here: it holds the Nexus login and usage history.
+config.json
+last_run.log
+request_usage.json
+browser-profile/
+diagnostics/
+
+# What the tool writes into a download folder, in case one is chosen inside this folder
+nexus_manifest.json
+requirements_report.md
+
+# Editors and operating system
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
