@@ -14,9 +14,9 @@ Chromium browser (Brave, Chrome or Edge - they are tried in that order).
 
 No Python on the computer, or you want one file to hand around? [Build the .exe](#build-the-exe) - it has Python inside.
 
-or
+**or**
 
-You **can download this exe** in the github release page at the left of the screen, V1.0.0, **download the NexusAutoDownloader.exe** and double click to run, no installation required
+You **can download this exe** in the github release page at the ringht of the screen, V1.0.0, **download the NexusAutoDownloader.exe** and double click to run, no installation required
 
 ## Log in (once)
 
