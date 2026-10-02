@@ -12,6 +12,8 @@ Double-click **`run.bat`**. The first run creates a private Python environment a
 dependencies (`playwright`, `requests`); after that it just opens the window. Needs Python 3.10+ and any
 Chromium browser (Brave, Chrome or Edge - they are tried in that order).
 
+No Python on the computer, or you want one file to hand around? [Build the .exe](#build-the-exe) - it has Python inside.
+
 ## Log in (once)
 
 1. Press **Open browser / log in**. A separate browser window opens on the Nexus login page. It has its own
@@ -162,6 +164,26 @@ Nexus's API policy asks every app to identify itself (this tool sends `Applicati
 `Application-Version`) and asks apps that reach a public audience to register with Nexus support. If you publish or
 fork this tool, please do that.
 
+## Build the .exe
+
+Double-click **`build.bat`**. It makes `dist\NexusAutoDownloader.exe`: the program, Python itself and the libraries in
+one file. Copy it anywhere; the computer that runs it needs no Python (only a browser, as always). Settings and login
+stay in `%LOCALAPPDATA%\NexusAutoDownloader`, exactly as with `run.bat`.
+
+- **Building needs Python 3.14.** If it is not installed, `build.bat` installs it from the `python-3.14.x-amd64.exe`
+  that lies next to it, into a `.python` folder (this user only, no admin rights, PATH untouched; it is listed under
+  Installed apps like any Python, where it can be uninstalled).
+- **What it does:** makes a clean environment (`.build-venv`), installs the libraries and PyInstaller, packs
+  everything, then **starts the new exe once** (`--self-test`) to prove that the window toolkit, the HTTPS certificates
+  and Playwright's Node driver really are inside it. A build whose self-test fails is reported as failed. The first
+  build takes a few minutes.
+- `build.bat --onedir` makes a folder with the exe in it instead of one file. The single file unpacks about 135 MB
+  into a temporary folder every time it starts (2 seconds on a fast disk, more on a slow one or while an antivirus
+  scans it); the folder starts in about 1. `build.bat --console` adds a console window, to see why a build will not
+  start.
+- Windows SmartScreen and antivirus programs sometimes object to programs made with PyInstaller, because the exe is
+  not code-signed. If yours removes it, allow the `dist` folder, or build with `--onedir`.
+
 ## Development
 
 ```
@@ -174,4 +196,5 @@ Layout: `urls.py` (link parsing) -> `nexus_api.py` (GraphQL: requirements, files
 (ordered plan) -> `job.py` (worker thread) which drives `browser.py` (attach to the browser), `site_flow.py` (the
 Nexus download page) and `downloads.py` (captures the file through the browser's DevTools events); `verify.py`
 checks archives for corruption; `cleanup.py` deletes downloaded files; `budget.py` enforces the request limits;
-`store.py` keeps settings, the manifest and the report; `app.py` is the Tkinter window.
+`store.py` keeps settings, the manifest and the report; `app.py` is the Tkinter window. `tools/build_exe.py` and
+`tools/launcher.py` make the .exe (see above); `build.bat` finds or installs Python for them.

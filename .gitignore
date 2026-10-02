@@ -10,6 +10,12 @@ __pycache__/
 build/
 dist/
 
+# Packaging (build.bat): its private build environment, a Python it installed from the installer, and that
+# installer (33 MB: keep it next to build.bat, but out of git)
+.build-venv/
+.python/
+python-*-amd64.exe
+
 # Data the tool keeps for the user. It normally lives in %LOCALAPPDATA%\NexusAutoDownloader, outside this
 # folder, but never commit any of it if it ever ends up here: it holds the Nexus login and usage history.
 config.json
