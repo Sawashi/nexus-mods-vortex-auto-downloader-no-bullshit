@@ -10,13 +10,15 @@ from typing import Callable, Protocol
 
 from .browser import LOGIN_URL, BrowserError, BrowserSession, ensure_browser
 from .budget import OFFICIAL_DAILY, OFFICIAL_HOURLY, RequestBudget, RequestLimitReached, format_duration
-from .downloads import DownloadFailed, DownloadWatcher
+from .downloads import DownloadFailed, DownloadWatcher, remove_leftovers
 from .errors import Cancelled
 from .nexus_api import FileInfo, NexusApi, NexusApiError
 from .resolver import Plan, PlanItem, Resolver
 from .site_flow import FlowError, LoginRequired, PageUnavailable, SiteFlow
-from .store import Config, Manifest, write_report
+from .store import Config, Existing, Manifest, write_report
 from .urls import Link
+from .util import format_size
+from .verify import check_file
 
 FREE_SPEED = 1.5 * 1024 * 1024  # bytes per second: what a free account is throttled to
 ATTEMPTS = 3
@@ -34,17 +36,6 @@ LARGE_COLLECTION_WARNING = (
 )
 
 
-def format_size(size: int | None) -> str:
-    if not size:
-        return ""
-    value = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return ""
-
-
 @dataclass
 class Row:
     """One line of the status table."""
@@ -55,6 +46,7 @@ class Row:
     size: int | None
     status: str
     url: str = ""  # set for rows the user has to deal with by hand
+    work: "Work | None" = None  # set for rows that are a file: what "Download again" and "Delete" act on
 
 
 class Ui(Protocol):
@@ -74,14 +66,33 @@ class Ui(Protocol):
 class Work:
     item: PlanItem
     file: FileInfo
+    existing: Existing  # what is already in the folder for this file
     skip: bool
 
     @property
     def row_id(self) -> str:
         return f"{self.item.ref.key}#{self.file.file_id}"
 
+    @property
+    def corrupt(self) -> bool:
+        return self.existing.state == "corrupt"
+
+
+def _rank(outcome: str) -> int:
+    """How good an outcome is, so a mod with several files shows its worst one in the report."""
+    if outcome == "already downloaded":
+        return 3
+    if outcome.startswith("downloaded"):
+        return 2
+    if outcome == "not downloaded":
+        return 1
+    return 0  # failed, unavailable, corrupted ...
+
 
 class Job:
+    """A run: scan the links, confirm, download. With `redo` (entries of an earlier run) it only downloads those
+    files again, without scanning, and always replaces the copy that is already there."""
+
     def __init__(
         self,
         config: Config,
@@ -89,20 +100,25 @@ class Job:
         ui: Ui,
         stop: threading.Event,
         budget: RequestBudget | None = None,
+        redo: list[Work] | None = None,
     ):
         self.config = config
         self.links = links
         self.ui = ui
         self.stop = stop
         self.budget = budget
-        self.results: dict[str, str] = {}  # mod key -> outcome, for the report
+        self.redo = redo
+        # A good copy is overwritten by the new one (not saved next to it) when downloading again on purpose.
+        self._replace_existing = redo is not None or not config.skip_existing
+        self.outcomes: dict[str, str] = {}  # row id -> what happened to that file
+        self._work: list[Work] = []
         self._current = ""
         self._waiting = False
 
     def run(self) -> None:
         summary = ""
         try:
-            summary = self._run()
+            summary = self._run() if self.redo is None else self._run_again()
         except Cancelled:
             summary = "Stopped."
         except RequestLimitReached as exc:
@@ -126,20 +142,14 @@ class Job:
 
         plan = self._scan()
         manifest = Manifest(directory)
-        work = [
-            Work(item, file, config.skip_existing and manifest.is_done(item.ref, file))
-            for item in plan.items
-            for file in item.files
-        ]
+        self._work = self._plan_work(plan, manifest)
+        work = self._work
         pending = [w for w in work if not w.skip]
-        for w in work:
-            if w.skip:
-                self.results.setdefault(w.item.ref.key, "already downloaded")
         ui.show_plan(self._rows(plan, work))
         self._log_plan(plan, work)
 
         if config.scan_only or not pending:
-            report = write_report(directory, plan, self.results)
+            report = write_report(directory, plan, self._results())
             ui.log(f"Report written: {report}")
             return "Scan finished." if config.scan_only else "Everything is already downloaded."
         if config.confirm and not ui.confirm("Start downloading?", self._confirm_text(plan, work, pending)):
@@ -148,11 +158,38 @@ class Job:
         try:
             counts = self._download(directory, manifest, pending, len(work) - len(pending))
         finally:  # also when stopped or failed halfway: the report shows what did and did not arrive
-            ui.log(f"Report written: {write_report(directory, plan, self.results)}")
-        return (
-            f"Done: {counts['downloaded']} downloaded, {len(work) - len(pending)} already there, "
-            f"{counts['failed']} failed."
-        )
+            ui.log(f"Report written: {write_report(directory, plan, self._results())}")
+        return self._summary(counts, len(work) - len(pending))
+
+    def _run_again(self) -> str:
+        """Download the chosen entries again. The table stays as it is and the full report is not rewritten."""
+        config, ui = self.config, self.ui
+        directory = Path(config.download_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest = Manifest(directory)
+        self._work = work = [Work(w.item, w.file, manifest.inspect(w.item.ref, w.file), False) for w in self.redo]
+        for w in work:
+            ui.set_status(w.row_id, self._queued_status(w))
+        if len(work) > 1 and config.confirm and not ui.confirm(
+            "Download these files again?", self._confirm_text(Plan(roots=[]), work, work)
+        ):
+            return "Cancelled before downloading."
+        return self._summary(self._download(directory, manifest, work, 0), 0)
+
+    @staticmethod
+    def _summary(counts: dict[str, int], already_there: int) -> str:
+        summary = f"Done: {counts['downloaded']} downloaded, {already_there} already there, {counts['failed']} failed."
+        if counts["replaced"]:
+            summary += f" {counts['replaced']} corrupted file(s) were replaced."
+        return summary
+
+    @staticmethod
+    def _queued_status(w: Work) -> str:
+        if w.skip:
+            return "already downloaded"
+        if w.corrupt:
+            return "queued (replaces a corrupted file)"
+        return "queued (downloads it again)" if w.existing.state == "ok" else "queued"
 
     def _scan(self) -> Plan:
         config = self.config
@@ -176,6 +213,41 @@ class Job:
                 f"{usage.day_used:,} of {usage.day_limit:,} in 24 hours."
             )
         return plan
+
+    def _plan_work(self, plan: Plan, manifest: Manifest) -> list[Work]:
+        """Look at what is already in the folder: intact files are skipped, corrupted ones will be replaced."""
+        work: list[Work] = []
+        for item in plan.items:
+            for file in item.files:
+                existing = manifest.inspect(item.ref, file)
+                skip = self.config.skip_existing and existing.state == "ok"
+                if skip and not existing.recorded:  # a valid copy the manifest did not know about: remember it
+                    size = existing.path.stat().st_size
+                    manifest.mark_done(item.ref, item.name, file, existing.path.name, size, item.required_by)
+                    self.ui.log(f"Found {existing.path.name} already in the folder - it will not be downloaded again.")
+                if existing.state == "corrupt":
+                    self.ui.log(
+                        f"Corrupted file found: {existing.path.name} ({existing.reason}). "
+                        "It will be deleted and downloaded again."
+                    )
+                work.append(Work(item, file, existing, skip))
+        return work
+
+    def _results(self) -> dict[str, str]:
+        """One outcome per mod for the report (its worst file decides)."""
+        results: dict[str, str] = {}
+        for w in self._work:
+            outcome = self.outcomes.get(w.row_id)
+            if outcome is None:
+                outcome = (
+                    "already downloaded" if w.skip
+                    else "corrupted file found (not replaced yet)" if w.corrupt
+                    else "not downloaded"
+                )
+            key = w.item.ref.key
+            if key not in results or _rank(outcome) < _rank(results[key]):
+                results[key] = outcome
+        return results
 
     # -- waiting politely ----------------------------------------------------------------------
 
@@ -210,12 +282,11 @@ class Job:
 
     # -- presenting the plan -------------------------------------------------------------------
 
-    @staticmethod
-    def _rows(plan: Plan, work: list[Work]) -> list[Row]:
+    def _rows(self, plan: Plan, work: list[Work]) -> list[Row]:
         rows = [
             Row(w.row_id, w.item.name,
                 f"{w.file.name} v{w.file.version}" + (" (optional)" if w.item.optional else ""),
-                w.file.size_bytes, "already downloaded" if w.skip else "queued")
+                w.file.size_bytes, self._queued_status(w), work=w)
             for w in work
         ]
         for number, ext in enumerate(plan.externals):
@@ -234,7 +305,7 @@ class Job:
                 f"{len(collection.mods)} mod(s){skipped}.")
         log(f"Plan: {len(plan.items)} mod(s), {len(work)} file(s), {format_size(total) or 'size unknown'}.")
         for number, w in enumerate(work, 1):
-            state = "  (already downloaded)" if w.skip else ""
+            state = "  (already downloaded)" if w.skip else "  (corrupted copy will be replaced)" if w.corrupt else ""
             log(f"  {number}. {w.item.name} - {w.file.name} v{w.file.version} {format_size(w.file.size_bytes)}{state}")
         for ext in plan.externals:
             log(f"  Off-site requirement of {ext.owner_name}: {ext.name} {ext.url} - get it yourself")
@@ -252,6 +323,9 @@ class Job:
         lines = [f"{len(pending)} file(s) to download: {format_size(size) or 'size unknown'}{eta}."]
         if len(work) > len(pending):
             lines.append(f"{len(work) - len(pending)} file(s) are already downloaded and will be skipped.")
+        corrupt = sum(1 for w in pending if w.corrupt)
+        if corrupt:
+            lines.append(f"{corrupt} corrupted file(s) in the folder will be deleted and downloaded again.")
         if plan.externals:
             lines.append(f"{len(plan.externals)} off-site requirement(s) you have to get yourself (see the table).")
         if plan.unavailable:
@@ -278,7 +352,9 @@ class Job:
 
     def _download(self, directory: Path, manifest: Manifest, pending: list[Work], skipped: int) -> dict[str, int]:
         config, ui = self.config, self.ui
-        counts = {"downloaded": 0, "failed": 0}
+        counts = {"downloaded": 0, "failed": 0, "replaced": 0}
+        for name in remove_leftovers(directory):
+            ui.log(f"Removed an unfinished download left over from an earlier run: {name}")
         ensure_browser(config.debug_port, LOGIN_URL, ui.log, config.browser_path)
         with BrowserSession(config.debug_port, self.stop.is_set, self.budget) as session:
             watcher = DownloadWatcher(session, directory)
@@ -298,16 +374,16 @@ class Job:
                     self._current = w.row_id
                     ui.set_progress(skipped + number - 1, skipped + len(pending), f"{w.item.name}")
                     self._wait_budget(PER_FILE_REQUESTS, session.sleep)
+                    self._clear_corrupt(manifest, w)
                     outcome = self._fetch(flow, manifest, w)
+                    self.outcomes[w.row_id] = outcome
                     ui.set_status(w.row_id, outcome)
                     ui.log(f"{w.item.name}: {outcome}")
-                    key = w.item.ref.key
-                    if outcome != "downloaded":
-                        counts["failed"] += 1
-                        self.results[key] = outcome
-                    else:
+                    if outcome.startswith("downloaded"):
                         counts["downloaded"] += 1
-                        self.results.setdefault(key, outcome)
+                        counts["replaced"] += w.corrupt
+                    else:
+                        counts["failed"] += 1
                     if number < len(pending):
                         session.sleep(config.delay_seconds)
                 ui.set_progress(skipped + len(pending), skipped + len(pending), "finished")
@@ -326,13 +402,47 @@ class Job:
             flow.wait_for_login()
         self.ui.set_login(True, "Logged in")
 
+    def _clear_corrupt(self, manifest: Manifest, w: Work) -> None:
+        """Delete the corrupted copy of a file right before it is downloaded again."""
+        if not w.corrupt:
+            return
+        path = w.existing.path
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.ui.log(f"Could not delete the corrupted file {path.name}: {exc.strerror or exc}. "
+                        "The new copy will be saved next to it.")
+            return
+        manifest.forget(w.item.ref, w.file.file_id)
+        self.outcomes[w.row_id] = "corrupted file deleted, the new download did not finish"  # until it does
+        self.ui.log(f"Deleted the corrupted file {path.name} ({w.existing.reason}); downloading it again.")
+        self.ui.set_status(w.row_id, "replacing corrupted file")
+
+    def _verify_download(self, path: Path, file: FileInfo) -> None:
+        """A finished download must be a sound archive; if not, it is deleted and the download is retried."""
+        problem = check_file(path, deep=True)
+        if problem:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise DownloadFailed(f"the downloaded file is corrupted: {problem}")
+        size = path.stat().st_size
+        if file.size_bytes is not None and size != file.size_bytes:
+            self.ui.log(
+                f"Note: Nexus lists {file.size_bytes:,} bytes for {path.name} but the file has {size:,}. "
+                "The download was complete and the archive is intact, so it is kept."
+            )
+
     def _fetch(self, flow: SiteFlow, manifest: Manifest, w: Work) -> str:
         """Download one file, retrying a couple of times. Returns the outcome text."""
+        replace = w.existing.path if self._replace_existing and w.existing.state == "ok" else None
         failures = 0
         while True:
             try:
                 self.ui.set_status(w.row_id, "opening page")
-                path = flow.download(w.item.ref, w.file)
+                path = flow.download(w.item.ref, w.file, replace)
+                self._verify_download(path, w.file)
             except LoginRequired:
                 self._ensure_login(flow)
                 continue
@@ -345,5 +455,7 @@ class Job:
                     return f"failed: {exc}"
                 flow.session.sleep(10 * failures)
                 continue
+            if replace is not None and replace != path:  # saved under another name: drop the superseded copy
+                replace.unlink(missing_ok=True)
             manifest.mark_done(w.item.ref, w.item.name, w.file, path.name, path.stat().st_size, w.item.required_by)
-            return "downloaded"
+            return "downloaded (replaced a corrupted file)" if w.corrupt else "downloaded"

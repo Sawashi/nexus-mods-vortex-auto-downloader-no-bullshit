@@ -1,6 +1,9 @@
 """Builders and a fake API shared by the tests."""
 from __future__ import annotations
 
+import zipfile
+from pathlib import Path
+
 from nexus_dl.nexus_api import (
     CollectionInfo,
     CollectionMod,
@@ -28,8 +31,25 @@ def file(
     size: int | None = 1000,
     name: str = "Main file",
     version: str = "1.0",
+    uri: str = "",
 ) -> FileInfo:
-    return FileInfo(file_id, name, version, category, date, size, primary, False)
+    return FileInfo(file_id, name, version, category, date, size, primary, False, uri)
+
+
+def make_zip(path: Path, files: dict[str, bytes] | None = None, *, stored: bool = False) -> Path:
+    """Write a small but real zip archive (a mod download is an archive, not arbitrary bytes)."""
+    files = files or {"readme.txt": b"hello mod " * 100, "data/blob.bin": bytes(range(256)) * 20}
+    method = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(path, "w", method) as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    return path
+
+
+def truncate(path: Path, keep: float = 0.5) -> None:
+    """Simulate an interrupted download: keep only the first part of the file."""
+    data = path.read_bytes()
+    path.write_bytes(data[: int(len(data) * keep)])
 
 
 def need(mod_id: int, name: str = "") -> Requirement:

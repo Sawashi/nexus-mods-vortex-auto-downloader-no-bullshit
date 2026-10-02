@@ -20,7 +20,7 @@ REQUIREMENTS_PAGE = 50
 STALE_CATEGORIES = {"OLD_VERSION", "REMOVED", "ARCHIVED"}
 
 _REQUIREMENT_FIELDS = "modId gameId modName url notes externalRequirement"
-_FILE_FIELDS = "fileId name version category date sizeInBytes primary requirementsAlert"
+_FILE_FIELDS = "fileId name uri version category date sizeInBytes primary requirementsAlert"
 
 _MOD_QUERY = f"""
 query ($modId: ID!, $gameId: ID!, $count: Int!) {{
@@ -77,6 +77,12 @@ class FileInfo:
     size_bytes: int | None
     primary: bool
     requirements_alert: bool
+    uri: str = ""
+
+    @property
+    def expected_name(self) -> str | None:
+        """The file name Nexus saves this file under, when the API tells it (newer files only get a storage path)."""
+        return self.uri if self.uri and "/" not in self.uri else None
 
 
 @dataclass(frozen=True)
@@ -304,6 +310,7 @@ class NexusApi:
             size_bytes=_to_int(raw.get("sizeInBytes")),
             primary=bool(raw.get("primary")),
             requirements_alert=bool(raw.get("requirementsAlert")),
+            uri=raw.get("uri") or "",
         )
 
     # -- collections -------------------------------------------------------------------------

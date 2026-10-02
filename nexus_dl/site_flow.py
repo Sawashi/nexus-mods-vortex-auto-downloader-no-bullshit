@@ -136,8 +136,11 @@ class SiteFlow:
 
     # -- downloading ---------------------------------------------------------------------------
 
-    def download(self, ref: ModRef, file: FileInfo) -> Path:
-        """Click through the download page for one file and return where it was saved."""
+    def download(self, ref: ModRef, file: FileInfo, replace: Path | None = None) -> Path:
+        """Click through the download page for one file and return where it was saved.
+
+        `replace` is an existing copy of the same file that the new download should overwrite.
+        """
         assert self.watcher is not None, "download() needs a DownloadWatcher"
         self.watcher.arm()
         self.open(ref.files_url(file.file_id))
@@ -160,8 +163,10 @@ class SiteFlow:
                 self._snapshot(ref, file)
                 raise
         self.on_status("downloading")
-        partial = self.watcher.wait_until_done(capture, self.stall_timeout, self.on_progress)
-        return self.watcher.save(capture, partial)
+        partial = self.watcher.wait_until_done(
+            capture, self.stall_timeout, self.on_progress, expected_size=file.size_bytes
+        )
+        return self.watcher.save(capture, partial, replace)
 
     def _file_component(self, file: FileInfo) -> Locator:
         component = self.page.locator(FILE_COMPONENT).first

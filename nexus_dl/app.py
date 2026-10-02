@@ -7,15 +7,17 @@ import tkinter as tk
 import webbrowser
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .browser import LOGIN_URL, BrowserError, BrowserSession, ensure_browser
 from .budget import OFFICIAL_DAILY, OFFICIAL_HOURLY, RequestBudget
-from .job import Job, Row, format_size
+from .cleanup import Removal, delete_everything, delete_files, summarize
+from .job import Job, Row, Work
 from .site_flow import SiteFlow
-from .store import APP_DIR, USAGE_PATH, Config, load_config, save_config
+from .store import APP_DIR, USAGE_PATH, Config, Manifest, load_config, save_config
 from .urls import parse_links
-from .util import hide_home
+from .util import format_size, hide_home
 
 LOG_PATH = APP_DIR / "last_run.log"
 PLACEHOLDER = (
@@ -28,6 +30,7 @@ FOOTER = (
     "downloads one file at a time and waits out the site's countdown. Not affiliated with Nexus Mods."
 )
 OK_COLOR, WARN_COLOR, STOP_COLOR = "#2e9e4f", "#c47f00", "#d03b3b"
+MAX_LISTED_DELETIONS = 20  # more than this and the log only gets the summary
 
 
 class Bridge:
@@ -114,11 +117,15 @@ class App:
         self.bridge = Bridge(root)
         self.worker: threading.Thread | None = None
         self.row_urls: dict[str, str] = {}
+        self.entries: dict[str, Work] = {}  # table rows that are a file: what Delete / Download again act on
+        self._table_dir: Path | None = None  # the folder the table was filled for
         self._row_count = 0
         self._placeholder_shown = False
+        self._announce = True  # pop up a message when a run ends (not for quick per-file actions)
+        self._job_running = self._stopping = self._cleaning = self._checking = False
         root.title("Nexus Mods Auto Downloader")
-        root.geometry("1000x900")
-        root.minsize(860, 760)
+        root.geometry("1000x940")
+        root.minsize(860, 800)
         self._build()
         self._refresh_usage()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -209,22 +216,53 @@ class App:
         ttk.Label(outer, text=FOOTER, wraplength=940, foreground="gray").pack(side="bottom", fill="x", pady=(6, 0))
         panes = ttk.PanedWindow(outer, orient="vertical")
         panes.pack(fill="both", expand=True, pady=(8, 0))
+
         table = ttk.Frame(panes)
         panes.add(table, weight=3)
+        table_header = ttk.Frame(table)
+        table_header.pack(fill="x", pady=(0, 3))
+        ttk.Label(table_header, text="Files (select rows, or right-click, to delete or download them again)").pack(
+            side="left")
+        self.delete_all_button = ttk.Button(
+            table_header, text="Delete all downloaded files", command=self.delete_all)
+        self.delete_all_button.pack(side="right")
+        self.delete_button = ttk.Button(
+            table_header, text="Delete file", command=self.delete_selected, state="disabled")
+        self.delete_button.pack(side="right", padx=6)
+        self.again_button = ttk.Button(
+            table_header, text="Download again", command=self.download_selected_again, state="disabled")
+        self.again_button.pack(side="right")
+        table_body = ttk.Frame(table)
+        table_body.pack(fill="both", expand=True)
         columns = ("n", "mod", "file", "size", "status")
-        self.tree = ttk.Treeview(table, columns=columns, show="headings", height=6)
+        self.tree = ttk.Treeview(table_body, columns=columns, show="headings", height=6)
         for name, title, width in (("n", "#", 36), ("mod", "Mod", 260), ("file", "File", 260),
                                    ("size", "Size", 80), ("status", "Status", 220)):
             self.tree.heading(name, text=title)
             self.tree.column(name, width=width, anchor="w", stretch=name in ("mod", "file", "status"))
-        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        scroll = ttk.Scrollbar(table_body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self.open_row_link)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_controls())
+        self.tree.bind("<Delete>", self.delete_selected)
+        self.tree.bind("<Button-3>", self._on_right_click)
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Download again", command=self.download_selected_again)
+        self.menu.add_command(label="Delete file", command=self.delete_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="Open link", command=self.open_row_link)
 
-        self.log_box = scrolledtext.ScrolledText(panes, height=8, wrap="word", state="disabled")
-        panes.add(self.log_box, weight=2)
+        log_frame = ttk.Frame(panes)
+        panes.add(log_frame, weight=2)
+        log_header = ttk.Frame(log_frame)
+        log_header.pack(fill="x", pady=(0, 3))
+        ttk.Label(log_header, text="Log").pack(side="left")
+        self.clear_log_button = ttk.Button(log_header, text="Clear log", command=self.clear_log)
+        self.clear_log_button.pack(side="right")
+        self.log_box = scrolledtext.ScrolledText(log_frame, height=8, wrap="word", state="disabled")
+        self.log_box.pack(fill="both", expand=True)
 
     # -- the links box and its placeholder ------------------------------------------------------
 
@@ -268,7 +306,35 @@ class App:
             pass
         return cfg
 
-    # -- actions -------------------------------------------------------------------------------
+    # -- which buttons may be used right now ---------------------------------------------------
+
+    def _busy(self) -> bool:
+        return self._job_running or self._cleaning or self._checking
+
+    def _selected_entries(self) -> list[tuple[str, Work]]:
+        """The selected table rows that are a file (off-site and unavailable rows have nothing to act on)."""
+        return [(row, self.entries[row]) for row in self.tree.selection() if row in self.entries]
+
+    def _refresh_controls(self) -> None:
+        def state(enabled: bool) -> str:
+            return "normal" if enabled else "disabled"
+
+        idle = not self._busy()
+        self.start_button.config(state=state(idle))
+        self.stop_button.config(state=state(self._job_running and not self._stopping))
+        self.open_button.config(state=state(idle))
+        self.check_button.config(state=state(idle))
+        self.delete_all_button.config(state=state(idle))
+        selected = idle and bool(self._selected_entries())
+        self.delete_button.config(state=state(selected))
+        self.again_button.config(state=state(selected))
+
+    def _refuse_while_busy(self) -> bool:
+        if self._busy():
+            self.append_log("Another action is in progress: wait for it to finish (or press Stop) first.")
+        return self._busy()
+
+    # -- running the downloader ----------------------------------------------------------------
 
     def browse(self) -> None:
         chosen = filedialog.askdirectory(title="Where should the mods be saved?", initialdir=self.folder.get() or None)
@@ -276,7 +342,7 @@ class App:
             self.folder.set(chosen)
 
     def start(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self._busy():
             return
         links, rejected = parse_links(self.links_text())
         if not links:
@@ -292,20 +358,27 @@ class App:
             messagebox.showerror("No folder", "Choose the folder the mods should be downloaded to.")
             return
         config = replace(self.collect_config())
-        self.stop.clear()
-        self._set_running(True)
         self.clear_table()
+        self._table_dir = Path(config.download_dir)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         LOG_PATH.write_text("", encoding="utf-8")
         for line in rejected:
             self.append_log(f"Ignored (not a mod or collection link): {line}")
-        job = Job(config, links, JobUi(self), self.stop, self.budget)
+        self._start_job(Job(config, links, JobUi(self), self.stop, self.budget), announce=True)
+
+    def _start_job(self, job: Job, announce: bool) -> None:
+        self.stop.clear()
+        self._stopping = False
+        self._job_running = True
+        self._announce = announce
+        self._refresh_controls()
         self.worker = threading.Thread(target=job.run, name="job", daemon=True)
         self.worker.start()
 
     def request_stop(self) -> None:
         self.stop.set()
-        self.stop_button.config(state="disabled")
+        self._stopping = True
+        self._refresh_controls()
         self.append_log("Stopping ...")
 
     def open_browser(self) -> None:
@@ -328,7 +401,8 @@ class App:
 
     def check_login(self) -> None:
         config = self.collect_config()
-        self._set_buttons_enabled(False)
+        self._checking = True
+        self._refresh_controls()
 
         def task() -> None:
             ui = JobUi(self)
@@ -344,14 +418,144 @@ class App:
                 ui.log(f"Could not check the login: {exc}")
                 ui.set_login(None, "Login check failed - see the log")
             finally:
-                self.bridge.post(self._set_buttons_enabled, True)
+                self.bridge.post(self._login_check_done)
 
         threading.Thread(target=task, daemon=True).start()
 
-    def open_row_link(self, _event) -> None:
+    def _login_check_done(self) -> None:
+        self._checking = False
+        self._refresh_controls()
+
+    # -- the file table: delete a file, download it again, delete everything -------------------
+
+    def _folder_of_table(self) -> Path | None:
+        folder = self._table_dir or (Path(self.folder.get().strip()) if self.folder.get().strip() else None)
+        if folder is None:
+            messagebox.showerror("No folder", "Choose the folder the mods are downloaded to.")
+        return folder
+
+    def delete_selected(self, _event=None) -> None:
+        """Quick delete: remove the downloaded file of each selected row. One row needs no confirmation."""
+        targets = self._selected_entries()
+        if not targets or self._refuse_while_busy():
+            return
+        if len(targets) > 1 and not messagebox.askyesno(
+            "Delete files",
+            f"Delete the downloaded files of the {len(targets)} selected entries?\n\nThis cannot be undone.",
+            icon="warning", default="no",
+        ):
+            return
+        folder = self._folder_of_table()
+        if folder is None:
+            return
+        pairs = [(work.item.ref, work.file) for _row, work in targets]
+        self._run_cleanup(folder, lambda manifest: delete_files(manifest, pairs))
+
+    def delete_all(self) -> None:
+        """Delete every file this tool downloaded into the folder (the ones its manifest lists), after asking."""
+        if self._refuse_while_busy():
+            return
+        text = self.folder.get().strip()
+        if not text or not Path(text).is_dir():
+            messagebox.showerror("No folder", "Choose the download folder first.")
+            return
+        folder = Path(text)
+        files = [item for item in Manifest(folder).tracked() if item.path is not None and item.path.is_file()]
+        if not files:
+            messagebox.showinfo("Delete all downloaded files",
+                                "No downloaded files are recorded for this folder, so there is nothing to delete.")
+            return
+        size = sum(item.path.stat().st_size for item in files)
+        if not messagebox.askyesno(
+            "Delete all downloaded files",
+            f"Delete the {len(files)} file(s) ({format_size(size)}) that this tool downloaded into\n{folder}\n\n"
+            "Other files in that folder are not touched. This cannot be undone.",
+            icon="warning", default="no",
+        ):
+            return
+        self._run_cleanup(folder, delete_everything)
+
+    def _run_cleanup(self, folder: Path, task) -> None:
+        """Run a deletion off the Tk thread (a big folder can take a while) and report back."""
+        self._cleaning = True
+        self._refresh_controls()
+
+        def work() -> None:
+            try:
+                removals = task(Manifest(folder))
+            except Exception as exc:
+                self.bridge.post(self._cleanup_failed, exc)
+                return
+            self.bridge.post(self._cleanup_done, removals)
+
+        threading.Thread(target=work, name="cleanup", daemon=True).start()
+
+    def _cleanup_done(self, removals: list[Removal]) -> None:
+        self._cleaning = False
+        for removal in removals:
+            if removal.state == "deleted":
+                status = "deleted"
+            elif removal.state == "missing":
+                status = "not on disk"
+            else:
+                status = f"could not delete: {removal.reason}"
+            self.set_row_status(removal.row_id, status, reveal=False)
+        deleted = [r for r in removals if r.state == "deleted"]
+        if len(removals) == 1 and deleted:  # a quick single delete: one clear line is enough
+            self.append_log(f"Deleted {deleted[0].name} ({format_size(deleted[0].size)})")
+        else:
+            if 0 < len(deleted) <= MAX_LISTED_DELETIONS:
+                for removal in deleted:
+                    self.append_log(f"Deleted {removal.name} ({format_size(removal.size)})")
+            for removal in removals:
+                if removal.state == "failed":
+                    self.append_log(f"Could not delete {removal.name or removal.row_id}: {removal.reason}")
+            self.append_log(summarize(removals))
+        self._refresh_controls()
+
+    def _cleanup_failed(self, exc: Exception) -> None:
+        self._cleaning = False
+        self.append_log(f"Deleting failed: {exc}")
+        self._refresh_controls()
+
+    def download_selected_again(self) -> None:
+        """Download the selected files again, replacing whatever copy is on disk. Needs no new scan."""
+        targets = self._selected_entries()
+        if not targets or self._refuse_while_busy():
+            return
+        folder = self._folder_of_table()
+        if folder is None:
+            return
+        config = replace(self.collect_config(), download_dir=str(folder))
+        works = [work for _row, work in targets]
+        self.append_log(f"Downloading {len(works)} file(s) again ...")
+        self._start_job(Job(config, [], JobUi(self), self.stop, self.budget, redo=works), announce=False)
+
+    def _on_right_click(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        self._refresh_controls()
+        can_act = bool(self._selected_entries()) and not self._busy()
+        for label in ("Download again", "Delete file"):
+            self.menu.entryconfig(label, state="normal" if can_act else "disabled")
+        self.menu.entryconfig("Open link", state="normal" if self.row_urls.get(row) else "disabled")
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def open_row_link(self, _event=None) -> None:
         selected = self.tree.selection()
         if selected and self.row_urls.get(selected[0]):
             webbrowser.open(self.row_urls[selected[0]])
+
+    def clear_log(self) -> None:
+        self.log_box.config(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.config(state="disabled")
 
     def on_close(self) -> None:
         self.bridge.closing.set()
@@ -363,16 +567,6 @@ class App:
         self.root.destroy()
 
     # -- updates coming from the worker (always on the Tk thread) ------------------------------
-
-    def _set_running(self, running: bool) -> None:
-        self.start_button.config(state="disabled" if running else "normal")
-        self.stop_button.config(state="normal" if running else "disabled")
-        self._set_buttons_enabled(not running)
-
-    def _set_buttons_enabled(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        self.open_button.config(state=state)
-        self.check_button.config(state=state)
 
     def _refresh_usage(self) -> None:
         usage = self.budget.usage()
@@ -400,10 +594,12 @@ class App:
     def clear_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self.row_urls.clear()
+        self.entries.clear()
         self._row_count = 0
         self.overall_bar.config(value=0)
         self.file_bar.config(value=0)
         self.overall_text.set("")
+        self._refresh_controls()
 
     def show_plan(self, rows: list[Row]) -> None:
         self.clear_table()
@@ -413,11 +609,14 @@ class App:
                              values=(self._row_count, row.mod, row.file, format_size(row.size), row.status))
             if row.url:
                 self.row_urls[row.id] = row.url
+            if row.work is not None:
+                self.entries[row.id] = row.work
 
-    def set_row_status(self, row_id: str, status: str) -> None:
+    def set_row_status(self, row_id: str, status: str, reveal: bool = True) -> None:
         if self.tree.exists(row_id):
             self.tree.set(row_id, "status", status)
-            self.tree.see(row_id)
+            if reveal:
+                self.tree.see(row_id)
 
     def set_overall(self, done: int, total: int, text: str) -> None:
         self.overall_bar.config(maximum=max(total, 1), value=done)
@@ -432,10 +631,12 @@ class App:
         self.login_dot.config(fg="gray" if logged_in is None else (OK_COLOR if logged_in else STOP_COLOR))
 
     def on_finished(self, summary: str) -> None:
-        self._set_running(False)
+        self._job_running = False
+        self._stopping = False
+        self._refresh_controls()
         self.overall_text.set(summary)
         self.append_log(summary)
-        if not self.bridge.closing.is_set():
+        if self._announce and not self.bridge.closing.is_set():
             messagebox.showinfo("Nexus Mods Auto Downloader", summary)
 
 

@@ -1,5 +1,3 @@
-# If this app useful to ya, you can give me a star, i will share more :)
-
 # Nexus Mods Auto Downloader
 
 Paste a Nexus Mods link, pick a folder, click **Download**. The tool downloads that mod **and every mod it
@@ -48,13 +46,61 @@ warn about, and the confirmation says so. Prefer Premium with Vortex for those.
 | Option | Meaning |
 |---|---|
 | Also download requirements | Follow each mod's requirements recursively (switch off to get only the mods you pasted) |
-| Skip files already downloaded | Uses `nexus_manifest.json` in the folder |
+| Skip files already downloaded | Keeps intact files as they are (see "Duplicates and corrupted files"); untick it to download everything again |
 | Ask me before downloading | Shows the count, size and request cost first |
 | Skip optional mods of collections | Leave out the entries a collection marks optional |
 | Scan only | Lists everything needed and writes the report, downloads nothing |
 | All main files | Also take every MAIN file of a mod, not only the author's primary file |
 | Pause between downloads | Seconds to wait between two files (default 5) |
 | Give up if a download does not start within | Covers the site's 5 s countdown (default 90 s) |
+
+## Delete files, download them again, clear the log
+
+The file table has actions for each entry. **Right-click a row**, or select one or more rows and use the buttons
+above the table (the **Delete** key works too):
+
+- **Delete file** - quick delete: removes the downloaded file of the selected row(s) and forgets it. One row is
+  deleted at once without a question; several rows ask first. The row stays in the table (status "deleted"), so
+  you can bring the file back with the next action.
+- **Download again** - downloads the selected file(s) again without scanning Nexus again. A copy that is already
+  there is only replaced once the new download is complete (a failed attempt keeps the old file), a corrupted copy
+  is deleted first, and the request budget and countdown apply as always. One file starts at once; several ask
+  first if "Ask me before downloading" is ticked. It also works on a row that failed or was deleted.
+
+Two buttons work on the whole window:
+
+- **Delete all downloaded files** - deletes every file this tool downloaded into the folder, i.e. the ones listed
+  in the folder's `nexus_manifest.json`, after a confirmation that names the folder and the number and size of
+  the files. Other files in the folder are never touched, and neither are the report and the manifest (which is
+  emptied). Deleted files are gone for good: they do not go to the Recycle Bin.
+- **Clear log** - empties the log window. (The log file of the last run, `last_run.log`, is kept until the next run.)
+
+Off-site and unavailable rows have no file, so only their link can be opened (double-click or right-click).
+These actions are disabled while a download, a deletion or a login check is in progress.
+
+## Duplicates and corrupted files
+
+Nothing is downloaded twice, and nothing corrupted is kept:
+
+- **Already there:** before downloading, the tool looks at what is in the folder. A file it downloaded earlier
+  (recorded in `nexus_manifest.json`) is skipped. A valid file it never recorded (manifest lost, or the file came
+  from Vortex or a browser) is recognised by the name Nexus gives it and skipped too. Newer Nexus files do not
+  expose their name, so those can only be recognised through the manifest.
+- **Corrupted:** an existing file is checked every run: it must not be empty, must have the size it had when it
+  was downloaded (or the size Nexus lists), and must be a readable archive (a zip's directory, the signature of
+  a .7z/.rar). If it fails, the tool says why, **deletes it and downloads it again**. The file is only deleted
+  right before its new download starts, so scanning, declining the confirmation or pressing Stop never deletes
+  anything.
+- **Fresh downloads** are tested before they are accepted: the size must match, and a zip is read completely and
+  its checksums verified. A damaged download is deleted and retried (3 attempts); if it stays damaged, no file
+  is left behind and it is reported as failed.
+- **Download again on purpose** (untick "Skip files already downloaded"): the new file replaces the old one
+  instead of being saved next to it as "name (1)".
+- **Leftovers:** half-finished downloads from an earlier crash (browser-named temporary files) are removed when a
+  run starts. Other files in your folder are never touched.
+
+There is no content checksum from Nexus to compare against, so the check can tell a truncated or damaged archive
+from a good one, but it cannot detect a file that was swapped for a different, valid archive of the same size.
 
 ## Request limits
 
@@ -126,6 +172,6 @@ python -m venv .venv
 
 Layout: `urls.py` (link parsing) -> `nexus_api.py` (GraphQL: requirements, files, collections) -> `resolver.py`
 (ordered plan) -> `job.py` (worker thread) which drives `browser.py` (attach to the browser), `site_flow.py` (the
-Nexus download page) and `downloads.py` (captures the file through the browser's DevTools events); `budget.py`
-enforces the request limits; `store.py` keeps settings, the manifest and the report; `app.py` is the Tkinter
-window.
+Nexus download page) and `downloads.py` (captures the file through the browser's DevTools events); `verify.py`
+checks archives for corruption; `cleanup.py` deletes downloaded files; `budget.py` enforces the request limits;
+`store.py` keeps settings, the manifest and the report; `app.py` is the Tkinter window.

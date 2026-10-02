@@ -11,6 +11,7 @@ from .nexus_api import FileInfo
 from .resolver import Plan
 from .urls import ModRef
 from .util import write_json
+from .verify import check_file
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "NexusAutoDownloader"
 CONFIG_PATH = APP_DIR / "config.json"
@@ -66,6 +67,26 @@ def save_config(config: Config, path: Path = CONFIG_PATH) -> None:
 # -- manifest --------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Existing:
+    """What is already in the download folder for one file."""
+
+    state: str  # "ok" (intact), "missing", or "corrupt"
+    path: Path | None = None
+    reason: str = ""  # why it is corrupt
+    recorded: bool = True  # False: found by the name Nexus gives it, not through the manifest (to be adopted)
+
+
+@dataclass(frozen=True)
+class Tracked:
+    """A file the manifest says this tool downloaded."""
+
+    row_id: str  # the table row of that file: "<game>:<mod id>#<file id>"
+    name: str
+    path: Path | None  # None when the recorded name is not a plain file name: such an entry is never acted on
+    size: int  # what it measured when it was downloaded
+
+
 class Manifest:
     """What has already been downloaded into a folder, so reruns skip it."""
 
@@ -86,12 +107,65 @@ class Manifest:
     def entry(self, ref: ModRef, file_id: int) -> dict | None:
         return self.mods.get(ref.key, {}).get("files", {}).get(str(file_id))
 
-    def is_done(self, ref: ModRef, file: FileInfo) -> bool:
+    def _file_path(self, name: str) -> Path | None:
+        """Where a file name from the manifest lives in the folder; None unless it is a plain file name.
+
+        The manifest is a file anyone can edit: a name like "..\\..\\x" must never lead outside the folder.
+        """
+        if not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name:
+            return None
+        return self.directory / name
+
+    def locate(self, ref: ModRef, file: FileInfo) -> Path | None:
+        """The copy of this file that is in the folder (recorded in the manifest or found by name), if any."""
         entry = self.entry(ref, file.file_id)
-        if not entry:
+        path = self._file_path(entry.get("fileName", "") if entry else file.expected_name or "")
+        return path if path is not None and path.is_file() else None
+
+    def tracked(self) -> list[Tracked]:
+        """Every file the manifest knows about."""
+        found = []
+        for mod_key, mod in self.mods.items():
+            for file_id, entry in mod.get("files", {}).items():
+                name = entry.get("fileName", "")
+                found.append(Tracked(f"{mod_key}#{file_id}", name, self._file_path(name), int(entry.get("size") or 0)))
+        return found
+
+    def inspect(self, ref: ModRef, file: FileInfo) -> Existing:
+        """Is this file already in the folder, and is the copy intact?
+
+        A file the manifest recorded is compared with the size it had when it was downloaded; a file the manifest
+        does not know is looked up by the name Nexus gives it and compared with the size Nexus lists.
+        """
+        entry = self.entry(ref, file.file_id)
+        if entry:
+            path, expected, recorded = self._file_path(entry.get("fileName", "")), entry.get("size"), True
+        elif file.expected_name:
+            path, expected, recorded = self._file_path(file.expected_name), file.size_bytes, False
+        else:
+            return Existing("missing")
+        if path is None or not path.is_file():
+            return Existing("missing")
+        problem = check_file(path, expected)
+        if problem:
+            return Existing("corrupt", path, problem, recorded)
+        return Existing("ok", path, "", recorded)
+
+    def is_done(self, ref: ModRef, file: FileInfo) -> bool:
+        return self.inspect(ref, file).state == "ok"
+
+    def drop(self, mod_key: str, file_id: int | str) -> bool:
+        """Remove one entry (in memory; call save() afterwards). Returns whether there was one."""
+        mod = self.mods.get(mod_key)
+        if not mod or mod.get("files", {}).pop(str(file_id), None) is None:
             return False
-        path = self.directory / entry.get("fileName", "")
-        return path.is_file() and path.stat().st_size == entry.get("size")
+        if not mod["files"]:
+            del self.mods[mod_key]
+        return True
+
+    def forget(self, ref: ModRef, file_id: int) -> None:
+        if self.drop(ref.key, file_id):
+            self.save()
 
     def mark_done(
         self, ref: ModRef, mod_name: str, file: FileInfo, file_name: str, size: int, required_by: list[ModRef]

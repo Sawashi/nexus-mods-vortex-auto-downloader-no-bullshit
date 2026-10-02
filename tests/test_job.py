@@ -1,16 +1,19 @@
+import os
 import threading
+import time
 
 import pytest
 
 from nexus_dl import job as job_module
 from nexus_dl.budget import RequestBudget
-from nexus_dl.downloads import DownloadFailed
+from nexus_dl.downloads import DownloadFailed, unique_path
 from nexus_dl.errors import Cancelled
 from nexus_dl.job import Job
 from nexus_dl.site_flow import LoginRequired, PageUnavailable
 from nexus_dl.store import Config, Manifest
+from nexus_dl.verify import check_file
 
-from .helpers import FakeApi, coll_ref, collection, file, mod, need, offsite, pin, ref
+from .helpers import FakeApi, coll_ref, collection, file, make_zip, mod, need, offsite, pin, ref, truncate
 
 
 class Clock:
@@ -83,11 +86,15 @@ class FakeWatcher:
 
 
 class FakeFlow:
-    """Plays back a script: file id -> list of outcomes (an exception is raised, anything else succeeds)."""
+    """Plays back a script: file id -> list of outcomes.
+
+    An exception is raised, "corrupt" saves a damaged archive, anything else saves a good zip.
+    """
 
     script: dict = {}
     member = 1
     downloaded: list = []
+    replace_args: list = []  # the `replace` argument of every download call
 
     def __init__(self, session, watcher, **kwargs):
         self.session, self.directory = session, watcher.directory
@@ -99,41 +106,57 @@ class FakeFlow:
         FakeFlow.member = 5
         return 5
 
-    def download(self, mod_ref, file_info):
+    def download(self, mod_ref, file_info, replace=None):
         outcomes = FakeFlow.script.get(file_info.file_id)
-        if outcomes:
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
+        outcome = outcomes.pop(0) if outcomes else None
+        if isinstance(outcome, Exception):
+            raise outcome
         FakeFlow.downloaded.append(mod_ref.mod_id)
-        path = self.directory / f"{mod_ref.mod_id}-{file_info.file_id}.zip"
-        path.write_bytes(b"x" * 10)
+        FakeFlow.replace_args.append(replace)
+        name = file_info.expected_name or f"{mod_ref.mod_id}-{file_info.file_id}.zip"
+        path = replace if replace is not None else unique_path(self.directory, name)
+        if outcome == "corrupt":
+            path.write_bytes(b"this is not a zip archive")
+        else:
+            make_zip(path)
         return path
 
 
 @pytest.fixture
 def run(tmp_path, monkeypatch):
     """run(api, links, **config) -> (ui, job); the browser layer is replaced by the fakes above."""
-    FakeFlow.script, FakeFlow.member, FakeFlow.downloaded = {}, 1, []
+    FakeFlow.script, FakeFlow.member, FakeFlow.downloaded, FakeFlow.replace_args = {}, 1, [], []
     FakeSession.on_sleep = None
     monkeypatch.setattr(job_module, "ensure_browser", lambda *a, **k: False)
     monkeypatch.setattr(job_module, "BrowserSession", FakeSession)
     monkeypatch.setattr(job_module, "DownloadWatcher", FakeWatcher)
     monkeypatch.setattr(job_module, "SiteFlow", FakeFlow)
 
-    def go(api, roots, ui=None, stop=None, budget=None, **options):
+    def go(api, roots, ui=None, stop=None, budget=None, redo=None, **options):
         api_kwargs = {}  # what the job passed to NexusApi(...)
         monkeypatch.setattr(job_module, "NexusApi", lambda **kwargs: api_kwargs.update(kwargs) or api)
         options.setdefault("confirm", False)
         config = Config(download_dir=str(tmp_path), delay_seconds=3, **options)
         ui = ui or FakeUi()
         links = [ref(r) if isinstance(r, int) else r for r in roots]
-        job = Job(config, links, ui, stop or threading.Event(), budget)
+        job = Job(config, links, ui, stop or threading.Event(), budget, redo)
         job.api_kwargs = api_kwargs
         job.run()
         return ui, job
 
     return go
+
+
+def put_download(tmp_path, mod_ref, file_info, name=None):
+    """Pretend an earlier run downloaded this file: a real zip on disk plus its manifest entry."""
+    name = name or f"{mod_ref.mod_id}-{file_info.file_id}.zip"
+    path = make_zip(tmp_path / name)
+    Manifest(tmp_path).mark_done(mod_ref, f"mod {mod_ref.mod_id}", file_info, name, path.stat().st_size, [])
+    return path
+
+
+def zips(tmp_path):
+    return sorted(p.name for p in tmp_path.glob("*.zip"))
 
 
 def test_downloads_requirements_first_then_records_everything(run, tmp_path):
@@ -157,16 +180,14 @@ def test_pauses_between_downloads_but_not_after_the_last(run):
 
 
 def test_skips_what_is_already_downloaded(run, tmp_path):
-    (tmp_path / "2-20.zip").write_bytes(b"x" * 10)
-    Manifest(tmp_path).mark_done(ref(2), "mod 2", file(20), "2-20.zip", 10, [])
+    put_download(tmp_path, ref(2), file(20))
     ui, _ = run(FakeApi(mod(1, [need(2)]), mod(2)), [1])
     assert FakeFlow.downloaded == [1]
     assert ui.summary == "Done: 1 downloaded, 1 already there, 0 failed."
 
 
 def test_everything_already_downloaded_does_not_open_the_browser(run, tmp_path, monkeypatch):
-    (tmp_path / "1-10.zip").write_bytes(b"x" * 10)
-    Manifest(tmp_path).mark_done(ref(1), "mod 1", file(10), "1-10.zip", 10, [])
+    put_download(tmp_path, ref(1), file(10))
     opened = []
     monkeypatch.setattr(job_module, "ensure_browser", lambda *a, **k: opened.append(1))
     ui, _ = run(FakeApi(mod(1)), [1])
@@ -255,6 +276,252 @@ def test_the_login_text_never_shows_the_member_number(run):
     FakeFlow.member = 0
     run(FakeApi(mod(1)), [1], ui=Ui())
     assert texts and not any(char.isdigit() for text in texts for char in text)
+
+
+# -- duplicates: a file that is already there is not downloaded again ---------------------------------
+
+
+def test_a_second_run_downloads_nothing_and_creates_no_copies(run, tmp_path):
+    api = FakeApi(mod(1, [need(2)]), mod(2))
+    run(api, [1])
+    FakeFlow.downloaded.clear()
+    ui, _ = run(api, [1])
+    assert FakeFlow.downloaded == [] and ui.summary == "Everything is already downloaded."
+    assert zips(tmp_path) == ["1-10.zip", "2-20.zip"]
+
+
+def test_a_valid_file_nobody_recorded_is_adopted_instead_of_downloaded_twice(run, tmp_path):
+    path = make_zip(tmp_path / "Some-Mod-1-1-0-1700000000.zip")  # e.g. the manifest was deleted, or Vortex got it
+    api = FakeApi(mod(1, files=[file(10, uri=path.name, size=path.stat().st_size)]))
+    ui, _ = run(api, [1])
+    assert FakeFlow.downloaded == [] and ui.summary == "Everything is already downloaded."
+    assert Manifest(tmp_path).entry(ref(1), 10)["fileName"] == path.name  # remembered from now on
+    assert any("Found Some-Mod-1-1-0-1700000000.zip already in the folder" in line for line in ui.logs)
+    assert zips(tmp_path) == [path.name]
+
+
+def test_downloading_again_on_request_overwrites_instead_of_making_a_copy(run, tmp_path):
+    api = FakeApi(mod(1))
+    run(api, [1])
+    FakeFlow.downloaded.clear()
+    ui, _ = run(api, [1], skip_existing=False)
+    assert FakeFlow.downloaded == [1]
+    assert FakeFlow.replace_args == [None, tmp_path / "1-10.zip"]  # the second call was told what to overwrite
+    assert zips(tmp_path) == ["1-10.zip"]
+    assert ui.rows[0].status == "queued (downloads it again)"
+
+
+# -- corrupted files: found, deleted and downloaded again --------------------------------------------
+
+
+def test_a_corrupted_file_is_deleted_and_downloaded_again(run, tmp_path):
+    api = FakeApi(mod(1))
+    run(api, [1])
+    path = tmp_path / "1-10.zip"
+    truncate(path, 0.5)  # the download gets damaged afterwards
+    FakeFlow.downloaded.clear()
+
+    ui, _ = run(api, [1])
+
+    assert FakeFlow.downloaded == [1]
+    assert zips(tmp_path) == ["1-10.zip"]  # no "(1)" copy and no corrupted leftover
+    assert check_file(path, deep=True) is None
+    assert Manifest(tmp_path).entry(ref(1), 10)["size"] == path.stat().st_size
+    assert ui.rows[0].status == "queued (replaces a corrupted file)"  # what the table showed before downloading
+    assert ui.status["cyberpunk2077:1#10"] == "downloaded (replaced a corrupted file)"  # ... and what it ended as
+    assert any("Corrupted file found: 1-10.zip" in line for line in ui.logs)
+    assert any("Deleted the corrupted file 1-10.zip" in line for line in ui.logs)
+    assert ui.summary == "Done: 1 downloaded, 0 already there, 0 failed. 1 corrupted file(s) were replaced."
+    assert "downloaded (replaced a corrupted file)" in (tmp_path / "requirements_report.md").read_text(encoding="utf-8")
+
+
+def test_the_plan_shows_which_files_are_corrupted_before_anything_happens(run, tmp_path):
+    api = FakeApi(mod(1), mod(2))
+    run(api, [1, 2])
+    truncate(tmp_path / "2-20.zip", 0.3)
+    ui = FakeUi(confirm=False)
+    run(api, [1, 2], ui=ui, confirm=True)
+    assert [row.status for row in ui.rows] == ["already downloaded", "queued (replaces a corrupted file)"]
+    assert "1 corrupted file(s) in the folder will be deleted and downloaded again" in ui.confirm_texts[0]
+
+
+def test_scanning_or_declining_never_deletes_a_corrupted_file(run, tmp_path):
+    api = FakeApi(mod(1))
+    run(api, [1])
+    path = tmp_path / "1-10.zip"
+    truncate(path, 0.5)
+    damaged = path.read_bytes()
+
+    ui, _ = run(api, [1], scan_only=True)
+    assert ui.summary == "Scan finished." and path.read_bytes() == damaged
+    assert "corrupted file found (not replaced yet)" in (tmp_path / "requirements_report.md").read_text(encoding="utf-8")
+
+    ui, _ = run(api, [1], ui=FakeUi(confirm=False), confirm=True)
+    assert path.read_bytes() == damaged and zips(tmp_path) == ["1-10.zip"]
+    assert Manifest(tmp_path).entry(ref(1), 10) is not None  # still remembered until it is actually replaced
+
+
+def test_if_the_new_download_also_fails_nothing_corrupted_is_left_and_the_next_run_recovers(run, tmp_path):
+    api = FakeApi(mod(1))
+    run(api, [1])
+    truncate(tmp_path / "1-10.zip", 0.5)
+    FakeFlow.script = {10: [DownloadFailed("offline")] * 3}
+
+    ui, _ = run(api, [1])
+    assert "1 failed" in ui.summary
+    assert zips(tmp_path) == [] and Manifest(tmp_path).entry(ref(1), 10) is None
+    assert "failed: offline" in (tmp_path / "requirements_report.md").read_text(encoding="utf-8")
+
+    FakeFlow.script = {}
+    ui, _ = run(api, [1])
+    assert ui.summary == "Done: 1 downloaded, 0 already there, 0 failed." and zips(tmp_path) == ["1-10.zip"]
+
+
+def test_a_file_with_the_right_name_but_the_wrong_size_is_replaced_once_not_forever(run, tmp_path):
+    path = make_zip(tmp_path / "Some-Mod-1-1-0-1700000000.zip")
+    api = FakeApi(mod(1, files=[file(10, uri=path.name, size=path.stat().st_size + 999)]))  # sizes disagree
+    ui, _ = run(api, [1])
+    assert FakeFlow.downloaded == [1] and zips(tmp_path) == [path.name]  # replaced in place, not duplicated
+    assert any("Corrupted file found" in line for line in ui.logs)
+
+    FakeFlow.downloaded.clear()
+    ui, _ = run(api, [1])  # the manifest now records what was really downloaded, so this is not repeated
+    assert FakeFlow.downloaded == [] and ui.summary == "Everything is already downloaded."
+
+
+# -- downloading chosen entries again -----------------------------------------------------------------
+
+
+def file_works(ui):
+    """What the table hands to "Download again": the `work` of every row that is a file."""
+    return [row.work for row in ui.rows if row.work is not None]
+
+
+def test_table_rows_carry_what_delete_and_download_again_need(run):
+    ui, _ = run(FakeApi(mod(1, [need(2), offsite("tool")]), mod(2)), [1])
+    assert [row.id for row in ui.rows if row.work] == ["cyberpunk2077:2#20", "cyberpunk2077:1#10"]
+    assert [row.work for row in ui.rows if row.id.startswith("ext:")] == [None]  # off-site: nothing to act on
+    work = file_works(ui)[0]
+    assert work.item.ref == ref(2) and work.file.file_id == 20
+
+
+def test_download_again_replaces_the_copy_without_scanning_or_rewriting_the_report(run, tmp_path):
+    api = FakeApi(mod(1))
+    ui, _ = run(api, [1])
+    works, report = file_works(ui), (tmp_path / "requirements_report.md").read_text(encoding="utf-8")
+    api.calls.clear()
+
+    ui2, job = run(api, [], redo=works)  # "skip existing" is on in the settings, and still the file is replaced
+
+    assert api.calls == [] and job.api_kwargs == {}  # nothing was looked up on Nexus
+    assert FakeFlow.downloaded == [1, 1] and FakeFlow.replace_args == [None, tmp_path / "1-10.zip"]
+    assert zips(tmp_path) == ["1-10.zip"]  # replaced, not copied
+    assert ui2.rows == []  # the table was left alone: only statuses change
+    assert ui2.status["cyberpunk2077:1#10"] == "downloaded"
+    assert ui2.summary == "Done: 1 downloaded, 0 already there, 0 failed."
+    assert (tmp_path / "requirements_report.md").read_text(encoding="utf-8") == report  # not rewritten
+
+
+def test_download_again_works_for_a_file_that_was_deleted(run, tmp_path):
+    api = FakeApi(mod(1))
+    ui, _ = run(api, [1])
+    works = file_works(ui)
+    (tmp_path / "1-10.zip").unlink()
+    ui2, _ = run(api, [], redo=works)
+    assert zips(tmp_path) == ["1-10.zip"] and FakeFlow.replace_args[-1] is None  # nothing to overwrite
+    assert ui2.summary == "Done: 1 downloaded, 0 already there, 0 failed."
+
+
+def test_download_again_of_a_corrupted_file_deletes_it_first(run, tmp_path):
+    api = FakeApi(mod(1))
+    ui, _ = run(api, [1])
+    works = file_works(ui)
+    truncate(tmp_path / "1-10.zip", 0.5)
+    ui2, _ = run(api, [], redo=works)
+    assert zips(tmp_path) == ["1-10.zip"] and check_file(tmp_path / "1-10.zip", deep=True) is None
+    assert any("Deleted the corrupted file 1-10.zip" in line for line in ui2.logs)
+    assert ui2.summary.endswith("1 corrupted file(s) were replaced.")
+
+
+def test_a_failed_download_again_keeps_the_old_good_copy(run, tmp_path):
+    api = FakeApi(mod(1))
+    ui, _ = run(api, [1])
+    works = file_works(ui)
+    before = (tmp_path / "1-10.zip").read_bytes()
+    FakeFlow.script = {10: [DownloadFailed("offline")] * 3}
+    ui2, _ = run(api, [], redo=works)
+    assert "1 failed" in ui2.summary
+    assert (tmp_path / "1-10.zip").read_bytes() == before  # the copy is only replaced once the new one is complete
+    assert Manifest(tmp_path).entry(ref(1), 10) is not None
+
+
+def test_downloading_several_entries_again_asks_first_but_a_single_one_does_not(run):
+    api = FakeApi(mod(1), mod(2))
+    ui, _ = run(api, [1, 2])
+    works = file_works(ui)
+    FakeFlow.downloaded.clear()
+
+    asking = FakeUi(confirm=False)
+    run(api, [], redo=works, ui=asking, confirm=True)
+    assert FakeFlow.downloaded == [] and asking.summary == "Cancelled before downloading."
+    assert "2 file(s) to download" in asking.confirm_texts[0]
+
+    quick = FakeUi(confirm=False)
+    run(api, [], redo=works[:1], ui=quick, confirm=True)
+    assert quick.confirm_texts == [] and len(FakeFlow.downloaded) == 1  # one file: no question, it just happens
+
+
+def test_download_again_still_waits_for_the_request_budget(run):
+    clock = Clock()
+    budget = RequestBudget(hourly=20, clock=clock)
+    api = FakeApi(mod(1))
+    ui, _ = run(api, [1])
+    works = file_works(ui)
+    budget.record(15)
+    FakeSession.on_sleep = clock.advance
+    ui2, _ = run(api, [], redo=works, budget=budget)
+    assert any("hourly request limit is close" in line for line in ui2.logs)
+    assert ui2.summary.startswith("Done: 1 downloaded")
+
+
+# -- a fresh download is checked before it is accepted ----------------------------------------------
+
+
+def test_a_corrupted_fresh_download_is_deleted_and_retried(run, tmp_path):
+    FakeFlow.script = {10: ["corrupt"]}
+    ui, _ = run(FakeApi(mod(1)), [1])
+    assert ui.summary == "Done: 1 downloaded, 0 already there, 0 failed."
+    assert zips(tmp_path) == ["1-10.zip"] and check_file(tmp_path / "1-10.zip", deep=True) is None
+    assert any("the downloaded file is corrupted" in line and "attempt 1 of 3" in line for line in ui.logs)
+
+
+def test_a_download_that_stays_corrupted_is_reported_and_leaves_no_file_behind(run, tmp_path):
+    FakeFlow.script = {10: ["corrupt"] * 3}
+    ui, _ = run(FakeApi(mod(1)), [1])
+    assert "1 failed" in ui.summary
+    assert ui.status["cyberpunk2077:1#10"].startswith("failed: the downloaded file is corrupted")
+    assert zips(tmp_path) == [] and Manifest(tmp_path).entry(ref(1), 10) is None
+
+
+def test_a_size_difference_with_nexus_is_only_a_note_when_the_archive_is_intact(run, tmp_path):
+    api = FakeApi(mod(1, files=[file(10, size=1234)]))  # Nexus lists a size the real zip does not have
+    ui, _ = run(api, [1])
+    assert ui.summary.startswith("Done: 1 downloaded") and zips(tmp_path) == ["1-10.zip"]
+    assert any("Nexus lists 1,234 bytes" in line for line in ui.logs)
+    ui, _ = run(api, [1])  # ... and it is not downloaded again and again because of that
+    assert ui.summary == "Everything is already downloaded."
+
+
+def test_leftovers_of_a_crashed_run_are_cleaned_up_before_downloading(run, tmp_path):
+    long_ago = time.time() - 3600
+    junk = tmp_path / "0F8FAD5B-D9CB-469F-A165-70867728950E"
+    junk.write_bytes(b"partial")
+    os.utime(junk, (long_ago, long_ago))
+    notes = tmp_path / "my notes.txt"
+    notes.write_text("not ours", encoding="utf-8")
+    ui, _ = run(FakeApi(mod(1)), [1])
+    assert not junk.exists() and notes.exists()
+    assert any("Removed an unfinished download" in line for line in ui.logs)
 
 
 # -- collections ----------------------------------------------------------------------------------

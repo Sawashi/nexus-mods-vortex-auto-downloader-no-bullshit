@@ -168,6 +168,14 @@ def test_hidden_or_missing_mods_are_unavailable():
     assert str(caught.value) == "Mod not found"  # the same message twice is shown once
 
 
+def test_the_expected_file_name_comes_from_the_uri_unless_it_is_only_a_storage_path():
+    plain = NexusApi._file({"fileId": 1, "uri": "RED4ext-2380-1-30-0-1773082858.zip"})
+    assert plain.expected_name == "RED4ext-2380-1-30-0-1773082858.zip"
+    storage = NexusApi._file({"fileId": 2, "uri": "8f/ba/44/8fba44ab-cdc1-4a1f-8b11-327dac30e29f"})
+    assert storage.expected_name is None  # newer files: the real name cannot be derived
+    assert NexusApi._file({"fileId": 3}).expected_name is None
+
+
 def test_unknown_game():
     client, _, _ = api(ok({"game": None}))
     with pytest.raises(ModUnavailable, match="unknown game"):

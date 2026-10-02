@@ -6,15 +6,20 @@ report progress events, so we know exactly when a download starts, how far it is
 from __future__ import annotations
 
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .browser import BrowserSession
 
+# What the browser calls a download while it is still in progress (we asked it to name files by their GUID).
+_UNFINISHED = re.compile(r"^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}(\.crdownload)?$")
+
 
 class DownloadFailed(Exception):
-    """The browser never started the download, it stalled, or the file is incomplete."""
+    """The browser never started the download, it stalled, or the file is incomplete or corrupted."""
 
 
 @dataclass
@@ -36,6 +41,22 @@ def unique_path(directory: Path, name: str) -> Path:
         path = directory / f"{stem} ({counter}){suffix}"
         counter += 1
     return path
+
+
+def remove_leftovers(directory: Path, min_age: float = 30.0) -> list[str]:
+    """Delete unfinished downloads (GUID-named files) that an earlier run left behind, e.g. after a crash."""
+    removed: list[str] = []
+    if not directory.is_dir():
+        return removed
+    now = time.time()
+    for path in directory.iterdir():
+        try:
+            if path.is_file() and _UNFINISHED.match(path.name) and now - path.stat().st_mtime >= min_age:
+                path.unlink()
+                removed.append(path.name)
+        except OSError:
+            pass
+    return removed
 
 
 class DownloadWatcher:
@@ -91,9 +112,17 @@ class DownloadWatcher:
         raise DownloadFailed(f"the download did not start within {timeout:.0f} s")
 
     def wait_until_done(
-        self, capture: Capture, stall_timeout: float, on_progress: Callable[[int, int], None] = lambda *_: None
+        self,
+        capture: Capture,
+        stall_timeout: float,
+        on_progress: Callable[[int, int], None] = lambda *_: None,
+        expected_size: int | None = None,
     ) -> Path:
-        """Wait for the file to finish, give up if no bytes arrive for `stall_timeout` seconds."""
+        """Wait for the file to finish, give up if no bytes arrive for `stall_timeout` seconds.
+
+        The finished file must have the size the browser announced; if the browser did not announce one, the size
+        Nexus lists for the file (`expected_size`) is used instead.
+        """
         last_bytes, idle = -1, 0.0
         try:
             while capture.state == "inProgress":
@@ -115,14 +144,20 @@ class DownloadWatcher:
         if capture.state != "completed" or not partial.is_file():
             self.discard(capture)
             raise DownloadFailed("the browser cancelled or failed the download")
-        if capture.total and partial.stat().st_size != capture.total:
+        wanted = capture.total or expected_size
+        if wanted and partial.stat().st_size != wanted:
             self.discard(capture)
             raise DownloadFailed("the downloaded file is incomplete")
         return partial
 
-    def save(self, capture: Capture, partial: Path) -> Path:
-        """Give the finished download its real name."""
-        target = unique_path(self.directory, capture.suggested_name or capture.guid)
+    def save(self, capture: Capture, partial: Path, replace: Path | None = None) -> Path:
+        """Give the finished download its real name.
+
+        With `replace` (a file deliberately being downloaded again) the new file takes its place instead of being
+        saved next to it as "name (1)".
+        """
+        name = capture.suggested_name or capture.guid
+        target = replace if replace is not None and replace.name == name else unique_path(self.directory, name)
         os.replace(partial, target)
         return target
 

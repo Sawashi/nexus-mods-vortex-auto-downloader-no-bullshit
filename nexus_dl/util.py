@@ -24,6 +24,18 @@ def write_json(path: Path, data) -> None:
         raise
 
 
+def format_size(size: int | None) -> str:
+    """12345678 -> '11.8 MB'; unknown or zero sizes give an empty string."""
+    if not size:
+        return ""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return ""
+
+
 def _home_pattern() -> re.Pattern | None:
     parts = [part for part in re.split(r"[\\/]", str(Path.home())) if part]
     if not parts:
